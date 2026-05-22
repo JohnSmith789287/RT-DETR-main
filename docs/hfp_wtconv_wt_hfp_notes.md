@@ -96,28 +96,50 @@ Y
 
 ```mermaid
 flowchart TD
-    X["X [B,C,H,W]"] --> DCT["DCT"]
-    DCT --> Mask["Mask low-frequency top-left"]
-    Mask --> IDCT["IDCT"]
-    IDCT --> F["High-frequency response F"]
+    X["Input X<br/>[B,C,H,W]<br/>例: [1,256,80,80]"] --> DCT["DCT<br/>形状不变<br/>[B,C,H,W]"]
+    DCT --> Mask["低频 Mask<br/>左上角低频置 0<br/>形状不变"]
+    Mask --> IDCT["IDCT<br/>频域 -> 空间域<br/>[B,C,H,W]"]
+    IDCT --> F["High-frequency response F<br/>[B,C,H,W]<br/>例: [1,256,80,80]"]
 
-    X --> SP["Spatial branch: X * F"]
+    X --> SP["Spatial branch<br/>X * F<br/>[B,C,H,W]"]
     F --> SP
 
-    F --> Pool["GAP + GMP"]
-    Pool --> Sum["ReLU + spatial sum"]
-    Sum --> Conv1["Grouped 1x1 Conv"]
-    Conv1 --> Conv2["Grouped 1x1 Conv + Sigmoid"]
-    Conv2 --> CW["Channel weight [B,C,1,1]"]
+    F --> Pool["Adaptive MaxPool + AvgPool<br/>[B,C,H,W] -> [B,C,8,8]"]
+    Pool --> Sum["ReLU + spatial sum<br/>[B,C,8,8] -> [B,C,1,1]"]
+    Sum --> Conv1["Grouped 1x1 Conv<br/>[B,C,1,1]"]
+    Conv1 --> Conv2["Grouped 1x1 Conv + Sigmoid<br/>[B,C,1,1]"]
+    Conv2 --> CW["Channel weight<br/>[B,C,1,1]<br/>例: [1,256,1,1]"]
 
-    X --> CP["Channel branch: X * Channel weight"]
+    X --> CP["Channel branch<br/>X * Channel weight<br/>[B,C,H,W]"]
     CW --> CP
 
-    SP --> Add["SP + CP"]
+    SP --> Add["SP + CP<br/>[B,C,H,W]"]
     CP --> Add
-    Add --> Out["3x3 Conv + GroupNorm"]
-    Out --> Y["Y"]
+    Add --> Out["3x3 Conv + GroupNorm<br/>形状不变"]
+    Out --> Y["Output Y<br/>[B,C,H,W]<br/>例: [1,256,80,80]"]
 ```
+
+这张图按一个具体张量走一遍就是：
+
+```text
+X:              [1,256,80,80]
+DCT(X):         [1,256,80,80]    # 只是换到 DCT 频域，张量尺寸不变
+Mask:           [1,256,80,80]    # 左上角低频系数置 0
+IDCT: F         [1,256,80,80]    # 回到空间域，得到高频响应图
+
+空间分支:
+X * F           [1,256,80,80]
+
+通道分支:
+F -> pool       [1,256,8,8]
+sum -> weight   [1,256,1,1]
+X * weight      [1,256,80,80]
+
+输出:
+spatial + channel -> 3x3 Conv + GN -> Y [1,256,80,80]
+```
+
+这里最关键的一点是：`F` 不是类别预测，也不是最终特征，而是“高频响应”。它的尺寸和 `X` 一样，所以可以直接做逐元素相乘。
 
 ### 4.1 空间分支做什么
 
@@ -283,17 +305,43 @@ Y
 
 ```mermaid
 flowchart TD
-    X["X [B,C,H,W]"] --> Base["Base depthwise conv"]
-    X --> DWT["DWT"]
-    DWT --> Bands["LL / LH / HL / HH"]
-    Bands --> Pack["reshape -> [B,4C,H/2,W/2]"]
-    Pack --> DWConv["Depthwise conv, groups=4C"]
-    DWConv --> Unpack["reshape -> [B,C,4,H/2,W/2]"]
-    Unpack --> IDWT["IDWT"]
-    Base --> Add["Add"]
+    X["Input X<br/>[B,C,H,W]<br/>例: [1,256,80,80]"] --> Base["Base depthwise conv<br/>[B,C,H,W]<br/>例: [1,256,80,80]"]
+    X --> DWT["DWT<br/>空间下采样 2 倍<br/>通道内拆 4 个子带"]
+    DWT --> Bands["Wavelet bands<br/>[B,C,4,H/2,W/2]<br/>例: [1,256,4,40,40]"]
+    Bands --> Pack["reshape<br/>[B,C,4,H/2,W/2] -> [B,4C,H/2,W/2]<br/>例: [1,1024,40,40]"]
+    Pack --> DWConv["Depthwise conv<br/>groups=4C<br/>形状不变"]
+    DWConv --> Unpack["reshape back<br/>[B,4C,H/2,W/2] -> [B,C,4,H/2,W/2]<br/>例: [1,256,4,40,40]"]
+    Unpack --> IDWT["IDWT<br/>4 个子带重建<br/>[B,C,H,W]"]
+    Base --> Add["Add<br/>base + wavelet branch<br/>[B,C,H,W]"]
     IDWT --> Add
-    Add --> Y["Y"]
+    Add --> Y["Output Y<br/>[B,C,H,W]<br/>例: [1,256,80,80]"]
 ```
+
+按 `X=[1,256,80,80]` 走一遍：
+
+```text
+X:                         [1,256,80,80]
+
+base branch:
+depthwise conv(X):         [1,256,80,80]
+
+wavelet branch:
+DWT(X):                    [1,256,4,40,40]
+其中 4 个子带分别是:
+LL:                        [1,256,40,40]
+LH:                        [1,256,40,40]
+HL:                        [1,256,40,40]
+HH:                        [1,256,40,40]
+
+reshape:                   [1,1024,40,40]
+depthwise conv groups=1024 [1,1024,40,40]
+reshape back:              [1,256,4,40,40]
+IDWT:                      [1,256,80,80]
+
+Y = base + wavelet:        [1,256,80,80]
+```
+
+所以 WTConv 的“卷积”不是只卷原图，而是把 `LL/LH/HL/HH` 当成 `4C` 个小通道去做 depthwise conv。它学习的是各个通道、各个小波子带上的局部滤波。
 
 WTConv 不是注意力模块，也不会显式告诉模型“哪里该增强高频、哪里该增强低频”。它更像是一个带小波先验的大感受野 depthwise convolution。
 
@@ -341,35 +389,71 @@ Y
 
 ```mermaid
 flowchart TD
-    X["X [B,C,H,W]"] --> Pad["Pad to even H,W"]
-    Pad --> DWT["DWT"]
-    DWT --> Bands["LL / LH / HL / HH"]
+    X["Input X<br/>[B,C,H,W]<br/>例: [1,256,80,80]"] --> Pad["Pad to even H,W<br/>偶数尺寸时不变<br/>例: [1,256,80,80]"]
+    Pad --> DWT["DWT<br/>[B,C,H,W] -> [B,C,4,H/2,W/2]"]
+    DWT --> Bands["LL / LH / HL / HH<br/>例: [1,256,4,40,40]"]
 
-    Bands --> KeepHF["Keep LH/HL/HH, discard LL"]
-    KeepHF --> PackHF["reshape -> [B,3C,H/2,W/2]"]
-    PackHF --> HFDW["Depthwise conv, groups=3C"]
-    HFDW --> UnpackHF["reshape -> [B,C,3,H/2,W/2]"]
-    UnpackHF --> ZeroLL["LL = 0, put back LH/HL/HH"]
-    ZeroLL --> IDWT["IDWT"]
-    IDWT --> F["Learnable high-frequency response F"]
+    Bands --> KeepHF["Keep LH/HL/HH<br/>丢弃 LL 低频<br/>[B,C,3,H/2,W/2]"]
+    KeepHF --> PackHF["reshape<br/>[B,C,3,H/2,W/2] -> [B,3C,H/2,W/2]<br/>例: [1,768,40,40]"]
+    PackHF --> HFDW["Depthwise conv<br/>groups=3C<br/>形状不变"]
+    HFDW --> UnpackHF["reshape back<br/>[B,3C,H/2,W/2] -> [B,C,3,H/2,W/2]<br/>例: [1,256,3,40,40]"]
+    UnpackHF --> ZeroLL["LL = 0<br/>放回 LH/HL/HH<br/>[B,C,4,H/2,W/2]"]
+    ZeroLL --> IDWT["IDWT<br/>高频子带重建到空间域<br/>[B,C,H,W]"]
+    IDWT --> F["Learnable high-frequency response F<br/>[B,C,H,W]<br/>例: [1,256,80,80]"]
 
-    X --> SP["Spatial branch: X * F"]
+    X --> SP["Spatial branch<br/>X * F<br/>[B,C,H,W]"]
     F --> SP
 
-    F --> Pool["Adaptive MaxPool + AvgPool"]
-    Pool --> Sum["ReLU + spatial sum"]
-    Sum --> C1["Grouped 1x1 Conv"]
-    C1 --> C2["Grouped 1x1 Conv + Sigmoid"]
-    C2 --> CW["Channel weight [B,C,1,1]"]
+    F --> Pool["Adaptive MaxPool + AvgPool<br/>[B,C,H,W] -> [B,C,8,8]"]
+    Pool --> Sum["ReLU + spatial sum<br/>[B,C,8,8] -> [B,C,1,1]"]
+    Sum --> C1["Grouped 1x1 Conv<br/>[B,C,1,1]"]
+    C1 --> C2["Grouped 1x1 Conv + Sigmoid<br/>[B,C,1,1]"]
+    C2 --> CW["Channel weight<br/>[B,C,1,1]<br/>例: [1,256,1,1]"]
 
-    X --> CP["Channel branch: X * Channel weight"]
+    X --> CP["Channel branch<br/>X * Channel weight<br/>[B,C,H,W]"]
     CW --> CP
 
-    SP --> Add["SP + CP"]
+    SP --> Add["SP + CP<br/>[B,C,H,W]"]
     CP --> Add
-    Add --> Out["3x3 Conv + GroupNorm"]
-    Out --> Y["Y"]
+    Add --> Out["3x3 Conv + GroupNorm<br/>形状不变"]
+    Out --> Y["Output Y<br/>[B,C,H,W]<br/>例: [1,256,80,80]"]
 ```
+
+按当前代码里的真实张量变化，`X=[1,256,80,80]` 时是这样：
+
+```text
+输入:
+X:                         [1,256,80,80]
+
+小波高频响应生成:
+pad_to_even(X):             [1,256,80,80]        # H/W 本来就是偶数，所以不补
+DWT: coeffs                 [1,256,4,40,40]
+取高频 coeffs[:,:,1:4]:     [1,256,3,40,40]
+reshape: high               [1,768,40,40]
+depthwise conv groups=768:  [1,768,40,40]
+reshape back:               [1,256,3,40,40]
+构造 high_coeffs:
+  LL = 0                    [1,256,1,40,40]
+  LH/HL/HH = learned high   [1,256,3,40,40]
+high_coeffs:                [1,256,4,40,40]
+IDWT(high_coeffs): F         [1,256,80,80]
+
+HFP 空间分支:
+spatial = X * F             [1,256,80,80]
+
+HFP 通道分支:
+F -> adaptive max pool      [1,256,8,8]
+F -> adaptive avg pool      [1,256,8,8]
+ReLU + spatial sum          [1,256,1,1]
+grouped 1x1 + sigmoid       [1,256,1,1]
+channel = X * weight        [1,256,80,80]
+
+输出:
+spatial + channel           [1,256,80,80]
+3x3 Conv + GroupNorm        [1,256,80,80]
+```
+
+这里的 `F` 可以理解成“被 depthwise conv 学习过的小波高频响应”。它不是直接拿 DWT 的高频子带硬重建，而是在 `LH/HL/HH` 上先学一层局部滤波，再 IDWT 回到原空间大小。
 
 这个版本可以这样解释：
 
@@ -417,43 +501,83 @@ Bottom-up PAN: downsample + concat + CSPRepLayer
 
 ```mermaid
 flowchart TD
-    C3["C3 stride=8"] --> Proj3["1x1 input_proj"]
-    C4["C4 stride=16"] --> Proj4["1x1 input_proj"]
-    C5["C5 stride=32"] --> Proj5["1x1 input_proj"]
+    C3["Backbone C3 stride=8<br/>[B,128,H/8,W/8]<br/>例: [1,128,80,80]"] --> Proj3["1x1 input_proj<br/>128 -> 256<br/>例: [1,256,80,80]"]
+    C4["Backbone C4 stride=16<br/>[B,256,H/16,W/16]<br/>例: [1,256,40,40]"] --> Proj4["1x1 input_proj<br/>256 -> 256<br/>例: [1,256,40,40]"]
+    C5["Backbone C5 stride=32<br/>[B,512,H/32,W/32]<br/>例: [1,512,20,20]"] --> Proj5["1x1 input_proj<br/>512 -> 256<br/>例: [1,256,20,20]"]
 
-    Proj3 --> W3["WT-HFP"]
-    Proj4 --> W4["WT-HFP"]
-    Proj5 --> W5["WT-HFP"]
+    Proj3 --> W3["WT-HFP on C3<br/>形状不变<br/>[1,256,80,80]"]
+    Proj4 --> W4["WT-HFP on C4<br/>形状不变<br/>[1,256,40,40]"]
+    Proj5 --> W5["WT-HFP on C5<br/>形状不变<br/>[1,256,20,20]"]
 
-    W5 --> AIFI["AIFI"]
-    AIFI --> TD5["Top-down P5"]
+    W5 --> AIFI["AIFI encoder<br/>flatten: [1,256,20,20] -> [1,400,256]<br/>reshape back: [1,256,20,20]"]
+    AIFI --> TD5["Top-down P5 seed<br/>[1,256,20,20]"]
 
-    TD5 --> Lat5["1x1 lateral conv"]
-    Lat5 --> Up5["Upsample x2"]
-    Up5 --> Cat4["Concat"]
+    TD5 --> Lat5["1x1 lateral conv<br/>[1,256,20,20]"]
+    Lat5 --> Up5["Upsample x2<br/>[1,256,40,40]"]
+    Up5 --> Cat4["Concat with C4<br/>[1,256,40,40] + [1,256,40,40]<br/>= [1,512,40,40]"]
     W4 --> Cat4
-    Cat4 --> CSP4["CSPRepLayer"]
-    CSP4 --> TD4["Top-down P4"]
+    Cat4 --> CSP4["CSPRepLayer<br/>512 -> 256<br/>[1,256,40,40]"]
+    CSP4 --> TD4["Top-down P4<br/>[1,256,40,40]"]
 
-    TD4 --> Lat4["1x1 lateral conv"]
-    Lat4 --> Up4["Upsample x2"]
-    Up4 --> Cat3["Concat"]
+    TD4 --> Lat4["1x1 lateral conv<br/>[1,256,40,40]"]
+    Lat4 --> Up4["Upsample x2<br/>[1,256,80,80]"]
+    Up4 --> Cat3["Concat with C3<br/>[1,256,80,80] + [1,256,80,80]<br/>= [1,512,80,80]"]
     W3 --> Cat3
-    Cat3 --> CSP3["CSPRepLayer"]
-    CSP3 --> TD3["Top-down P3"]
+    Cat3 --> CSP3["CSPRepLayer<br/>512 -> 256<br/>[1,256,80,80]"]
+    CSP3 --> TD3["Top-down P3<br/>[1,256,80,80]"]
 
-    TD3 --> Out3["Output P3"]
-    TD3 --> Down3["Downsample"]
-    Down3 --> PCat4["Concat with P4"]
+    TD3 --> Out3["Output P3<br/>[1,256,80,80]"]
+    TD3 --> Down3["Downsample<br/>[1,256,80,80] -> [1,256,40,40]"]
+    Down3 --> PCat4["Concat with P4<br/>[1,256,40,40] + [1,256,40,40]<br/>= [1,512,40,40]"]
     TD4 --> PCat4
-    PCat4 --> PAN4["CSPRepLayer"]
-    PAN4 --> Out4["Output P4"]
+    PCat4 --> PAN4["CSPRepLayer<br/>512 -> 256<br/>[1,256,40,40]"]
+    PAN4 --> Out4["Output P4<br/>[1,256,40,40]"]
 
-    PAN4 --> Down4["Downsample"]
-    Down4 --> PCat5["Concat with P5"]
+    PAN4 --> Down4["Downsample<br/>[1,256,40,40] -> [1,256,20,20]"]
+    Down4 --> PCat5["Concat with P5<br/>[1,256,20,20] + [1,256,20,20]<br/>= [1,512,20,20]"]
     TD5 --> PCat5
-    PCat5 --> PAN5["CSPRepLayer"]
-    PAN5 --> Out5["Output P5"]
+    PCat5 --> PAN5["CSPRepLayer<br/>512 -> 256<br/>[1,256,20,20]"]
+    PAN5 --> Out5["Output P5<br/>[1,256,20,20]"]
+```
+
+如果输入图像按 `640x640` 举例，当前配置的数据流可以更直白地写成：
+
+```text
+Backbone:
+C3 = [1,128,80,80]
+C4 = [1,256,40,40]
+C5 = [1,512,20,20]
+
+input_proj 统一通道:
+C3' = [1,256,80,80]
+C4' = [1,256,40,40]
+C5' = [1,256,20,20]
+
+WT-HFP 插入位置:
+W3 = WT-HFP(C3') = [1,256,80,80]
+W4 = WT-HFP(C4') = [1,256,40,40]
+W5 = WT-HFP(C5') = [1,256,20,20]
+
+AIFI 只处理最高层:
+W5 flatten = [1,400,256]
+AIFI output reshape = [1,256,20,20]
+
+Top-down:
+P5 upsample -> [1,256,40,40]
+concat(P5_up, W4) -> [1,512,40,40] -> CSP -> P4 [1,256,40,40]
+P4 upsample -> [1,256,80,80]
+concat(P4_up, W3) -> [1,512,80,80] -> CSP -> P3 [1,256,80,80]
+
+Bottom-up:
+P3 downsample -> [1,256,40,40]
+concat(P3_down, P4) -> [1,512,40,40] -> PAN -> Out4 [1,256,40,40]
+Out4 downsample -> [1,256,20,20]
+concat(Out4_down, P5) -> [1,512,20,20] -> PAN -> Out5 [1,256,20,20]
+
+最终给 decoder:
+P3 = [1,256,80,80]
+P4 = [1,256,40,40]
+P5 = [1,256,20,20]
 ```
 
 注意这里不是传统 FPN 的相加融合，而是 RT-DETR 的：
