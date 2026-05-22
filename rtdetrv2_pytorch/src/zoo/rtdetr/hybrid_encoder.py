@@ -201,9 +201,7 @@ class HybridEncoder(nn.Module):
                  version='v2',
                  use_wt_hfp=False,
                  wt_hfp_apply_idx=None,
-                 wt_hfp_wt_type='db1',
-                 wt_hfp_kernel_size=3,
-                 wt_hfp_init_alpha=0.01):
+                 wt_hfp_wt_type='db1'):
         super().__init__()
         self.in_channels = in_channels
         self.feat_strides = feat_strides
@@ -247,7 +245,7 @@ class HybridEncoder(nn.Module):
         # WT-HFP follows the HS-FPN lateral-enhancement idea: enhance projected
         # C3/C4/C5 features before AIFI and top-down fusion.
         if use_wt_hfp:
-            from ...nn.extra.wt_hfp_module import WaveletHighLowFrequencyPerception
+            from ...nn.extra.wt_hfp_module import WaveletHighFrequencyPerception
             if wt_hfp_apply_idx is None:
                 wt_hfp_apply_idx = list(range(len(in_channels)))
             self.wt_hfp_apply_idx = list(wt_hfp_apply_idx)
@@ -255,11 +253,9 @@ class HybridEncoder(nn.Module):
             if invalid_idx:
                 raise ValueError(f'Invalid wt_hfp_apply_idx values: {invalid_idx}')
             self.wt_hfp_modules = nn.ModuleList([
-                WaveletHighLowFrequencyPerception(
+                WaveletHighFrequencyPerception(
                     hidden_dim,
                     wt_type=wt_hfp_wt_type,
-                    kernel_size=wt_hfp_kernel_size,
-                    init_alpha=wt_hfp_init_alpha,
                 )
                 for _ in in_channels
             ])

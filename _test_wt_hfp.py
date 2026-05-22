@@ -6,14 +6,24 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'rtdetrv2_pytorch'))
 
 import torch
 
-from src.nn.extra.wt_hfp_module import WaveletHighLowFrequencyPerception
+from src.nn.extra.wt_hfp_module import WaveletHighFrequencyPerception
 from src.zoo.rtdetr.hybrid_encoder import HybridEncoder
 
 
 def test_standalone_wt_hfp():
     print("=" * 60)
-    print("Test 1: standalone WT-HFP")
-    module = WaveletHighLowFrequencyPerception(256, wt_type='db1', kernel_size=3)
+    print("Test 1: standalone WT-HFP with HFP-style branches")
+    module = WaveletHighFrequencyPerception(256, wt_type='db1')
+    assert not hasattr(module, 'spatial_gate')
+    assert not hasattr(module, 'channel_gate')
+    assert not hasattr(module, 'subband_conv')
+    assert not hasattr(module, 'alpha')
+
+    constant = torch.ones(1, 256, 16, 16)
+    high_response = module._high_frequency_response(constant)
+    assert high_response.shape == constant.shape
+    assert high_response.abs().max() < 1e-5
+
     for h, w in [(80, 80), (41, 39), (20, 20)]:
         x = torch.randn(2, 256, h, w, requires_grad=True)
         y = module(x)
