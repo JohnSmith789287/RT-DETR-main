@@ -24,22 +24,26 @@ class WaveletHighFrequencyPerception(nn.Module):
     """HFP-style module with DWT replacing the DCT high-pass generator.
 
     Input and output shape are both ``[B, C, H, W]``. The module decomposes a
-    feature map with DWT, reconstructs only LH/HL/HH as the high-frequency
-    response, then follows HFP's spatial branch, channel branch, and output
-    projection structure.
+    feature map with DWT, refines LH/HL/HH using depthwise convolution,
+    reconstructs the learnable high-frequency response, then follows HFP's
+    spatial branch, channel branch, and output projection structure.
     """
 
     def __init__(
         self,
         in_channels: int,
         wt_type: str = 'db1',
+        kernel_size: int = 3,
         patch: tuple[int, int] = (8, 8),
         norm_groups: int = 32,
     ) -> None:
         super().__init__()
+        if kernel_size % 2 == 0:
+            raise ValueError(f'kernel_size must be odd, got {kernel_size}')
 
         self.in_channels = in_channels
         self.wt_type = wt_type
+        self.kernel_size = kernel_size
         self.patch = patch
 
         wt_filter, iwt_filter = wavelet.create_2d_wavelet_filter(
@@ -47,6 +51,15 @@ class WaveletHighFrequencyPerception(nn.Module):
         )
         self.wt_filter = nn.Parameter(wt_filter, requires_grad=False)
         self.iwt_filter = nn.Parameter(iwt_filter, requires_grad=False)
+
+        self.high_subband_conv = nn.Conv2d(
+            in_channels * 3,
+            in_channels * 3,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=in_channels * 3,
+            bias=False,
+        )
 
         channel_groups = _valid_groups(in_channels, norm_groups)
         self.channel1x1 = nn.Conv2d(
@@ -77,8 +90,14 @@ class WaveletHighFrequencyPerception(nn.Module):
     def _high_frequency_response(self, x: torch.Tensor) -> torch.Tensor:
         x_pad, original_shape = self._pad_to_even(x)
         coeffs = wavelet.wavelet_2d_transform(x_pad, self.wt_filter)
+        b, c, _, h, w = coeffs.shape
+
+        high = coeffs[:, :, 1:4, :, :].reshape(b, c * 3, h, w)
+        high = self.high_subband_conv(high)
+        high = high.reshape(b, c, 3, h, w)
+
         high_coeffs = torch.zeros_like(coeffs)
-        high_coeffs[:, :, 1:4, :, :] = coeffs[:, :, 1:4, :, :]
+        high_coeffs[:, :, 1:4, :, :] = high
         return self._idwt_crop(high_coeffs, original_shape)
 
     def _channel_weight(self, high_response: torch.Tensor) -> torch.Tensor:

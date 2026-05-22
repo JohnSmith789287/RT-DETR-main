@@ -24,6 +24,7 @@ HybridEncoder:
   use_wt_hfp: True
   wt_hfp_apply_idx: [0, 1, 2]
   wt_hfp_wt_type: db1
+  wt_hfp_kernel_size: 3
 
 
 RTDETRTransformerv2:

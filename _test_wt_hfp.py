@@ -16,8 +16,10 @@ def test_standalone_wt_hfp():
     module = WaveletHighFrequencyPerception(256, wt_type='db1')
     assert not hasattr(module, 'spatial_gate')
     assert not hasattr(module, 'channel_gate')
-    assert not hasattr(module, 'subband_conv')
     assert not hasattr(module, 'alpha')
+    assert module.high_subband_conv.groups == 256 * 3
+    assert module.high_subband_conv.in_channels == 256 * 3
+    assert module.high_subband_conv.out_channels == 256 * 3
 
     constant = torch.ones(1, 256, 16, 16)
     high_response = module._high_frequency_response(constant)

@@ -201,7 +201,8 @@ class HybridEncoder(nn.Module):
                  version='v2',
                  use_wt_hfp=False,
                  wt_hfp_apply_idx=None,
-                 wt_hfp_wt_type='db1'):
+                 wt_hfp_wt_type='db1',
+                 wt_hfp_kernel_size=3):
         super().__init__()
         self.in_channels = in_channels
         self.feat_strides = feat_strides
@@ -256,6 +257,7 @@ class HybridEncoder(nn.Module):
                 WaveletHighFrequencyPerception(
                     hidden_dim,
                     wt_type=wt_hfp_wt_type,
+                    kernel_size=wt_hfp_kernel_size,
                 )
                 for _ in in_channels
             ])
