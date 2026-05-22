@@ -13,6 +13,24 @@ from ._solver import BaseSolver
 from .det_engine import train_one_epoch, evaluate
 
 
+def _checkpoint_paths_for_epoch(output_dir, epoch, checkpoint_freq):
+    checkpoint_paths = [output_dir / 'last.pth']
+    if checkpoint_freq > 0 and (epoch + 1) % checkpoint_freq == 0:
+        checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
+    return checkpoint_paths
+
+
+def _cleanup_periodic_checkpoints(output_dir, max_keep):
+    if max_keep is None or max_keep <= 0:
+        return []
+
+    checkpoints = sorted(output_dir.glob('checkpoint[0-9][0-9][0-9][0-9].pth'))
+    remove_paths = checkpoints[:-max_keep]
+    for path in remove_paths:
+        path.unlink(missing_ok=True)
+    return remove_paths
+
+
 class DetSolver(BaseSolver):
     
     def fit(self, ):
@@ -56,12 +74,13 @@ class DetSolver(BaseSolver):
             self.last_epoch += 1
 
             if self.output_dir:
-                checkpoint_paths = [self.output_dir / 'last.pth']
-                # extra checkpoint before LR drop and every 100 epochs
-                if (epoch + 1) % args.checkpoint_freq == 0:
-                    checkpoint_paths.append(self.output_dir / f'checkpoint{epoch:04}.pth')
+                checkpoint_paths = _checkpoint_paths_for_epoch(
+                    self.output_dir, epoch, args.checkpoint_freq)
                 for checkpoint_path in checkpoint_paths:
                     dist_utils.save_on_master(self.state_dict(), checkpoint_path)
+                if dist_utils.is_main_process() and len(checkpoint_paths) > 1:
+                    _cleanup_periodic_checkpoints(
+                        self.output_dir, args.checkpoint_max_keep)
 
             module = self.ema.module if self.ema else self.model
             test_stats, coco_evaluator = evaluate(
