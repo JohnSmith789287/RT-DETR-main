@@ -1,0 +1,49 @@
+__include__: [
+  './rtdetrv2_r18vd_120e_coco.yml',
+]
+
+
+output_dir: ./output/rtdetrv2_firesmoke_guidenet_dfire
+
+
+# ---------------------------------------------------------------------------
+# FireSmokeGuideNet backbone
+#
+# FasterNet-T0 feature extractor with Fire-Smoke Dual Prior (FSDP) inserted
+# after stage1 and stage2, i.e. stride-8 / stride-16 features.  This keeps C5
+# before AIFI unchanged while injecting D-Fire-specific physical priors into
+# detail-rich middle stages.
+#
+# Channels [80, 160, 320] at strides [8, 16, 32].
+# ---------------------------------------------------------------------------
+
+RTDETR:
+  backbone: FireSmokeGuideNet
+  encoder: HybridEncoder
+  decoder: RTDETRTransformerv2
+
+
+FireSmokeGuideNet:
+  embed_dim: 40
+  depths: [1, 2, 8, 2]
+  mlp_ratio: 2.0
+  n_div: 4
+  drop_path_rate: 0.0
+  layer_scale_init_value: 0.0
+  norm_layer: BN
+  act_layer: GELU
+  return_idx: [1, 2, 3]
+  pretrained: '/root/rivermind-data/lost+found/rtdetrv2_pytorch/pretrained/fasternet_t0-epoch.281-val_acc1.71.9180.pth'
+  fsdp_stage_idx: [1, 2]
+  fsdp_alpha_init: 0.01
+  use_physics: False
+
+
+HybridEncoder:
+  in_channels: [80, 160, 320]
+
+
+lr_scheduler:
+  type: MultiStepLR
+  milestones: [70, 100]
+  gamma: 0.1
