@@ -112,6 +112,46 @@ class CSPRepLayer(nn.Module):
         return self.conv3(x_1 + x_2)
 
 
+class WaveletCSPRepLayer(nn.Module):
+    """CSPRepLayer variant that replaces RepVgg blocks with WT-HFP blocks."""
+
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 num_blocks=3,
+                 expansion=1.0,
+                 bias=None,
+                 act="silu",
+                 wt_type='db1',
+                 kernel_size=3,
+                 init_alpha=0.01):
+        super(WaveletCSPRepLayer, self).__init__()
+        from ...nn.extra.wt_hfp_module import WaveletHighLowFrequencyPerception
+
+        hidden_channels = int(out_channels * expansion)
+        self.conv1 = ConvNormLayer(in_channels, hidden_channels, 1, 1, bias=bias, act=act)
+        self.conv2 = ConvNormLayer(in_channels, hidden_channels, 1, 1, bias=bias, act=act)
+        self.bottlenecks = nn.Sequential(*[
+            WaveletHighLowFrequencyPerception(
+                hidden_channels,
+                wt_type=wt_type,
+                kernel_size=kernel_size,
+                init_alpha=init_alpha,
+            )
+            for _ in range(num_blocks)
+        ])
+        if hidden_channels != out_channels:
+            self.conv3 = ConvNormLayer(hidden_channels, out_channels, 1, 1, bias=bias, act=act)
+        else:
+            self.conv3 = nn.Identity()
+
+    def forward(self, x):
+        x_1 = self.conv1(x)
+        x_1 = self.bottlenecks(x_1)
+        x_2 = self.conv2(x)
+        return self.conv3(x_1 + x_2)
+
+
 # transformer
 class TransformerEncoderLayer(nn.Module):
     def __init__(self,
@@ -202,7 +242,11 @@ class HybridEncoder(nn.Module):
                  use_wt_hfp=False,
                  wt_hfp_apply_idx=None,
                  wt_hfp_wt_type='db1',
-                 wt_hfp_kernel_size=3):
+                 wt_hfp_kernel_size=3,
+                 use_wt_hfp_csp=False,
+                 wt_hfp_csp_wt_type='db1',
+                 wt_hfp_csp_kernel_size=3,
+                 wt_hfp_csp_init_alpha=0.01):
         super().__init__()
         self.in_channels = in_channels
         self.feat_strides = feat_strides
@@ -262,13 +306,29 @@ class HybridEncoder(nn.Module):
                 for _ in in_channels
             ])
 
+        fpn_pan_block = WaveletCSPRepLayer if use_wt_hfp_csp else CSPRepLayer
+        fpn_pan_block_kwargs = {}
+        if use_wt_hfp_csp:
+            fpn_pan_block_kwargs = {
+                'wt_type': wt_hfp_csp_wt_type,
+                'kernel_size': wt_hfp_csp_kernel_size,
+                'init_alpha': wt_hfp_csp_init_alpha,
+            }
+
         # top-down fpn
         self.lateral_convs = nn.ModuleList()
         self.fpn_blocks = nn.ModuleList()
         for _ in range(len(in_channels) - 1, 0, -1):
             self.lateral_convs.append(ConvNormLayer(hidden_dim, hidden_dim, 1, 1, act=act))
             self.fpn_blocks.append(
-                CSPRepLayer(hidden_dim * 2, hidden_dim, round(3 * depth_mult), act=act, expansion=expansion)
+                fpn_pan_block(
+                    hidden_dim * 2,
+                    hidden_dim,
+                    round(3 * depth_mult),
+                    act=act,
+                    expansion=expansion,
+                    **fpn_pan_block_kwargs,
+                )
             )
 
         # bottom-up pan
@@ -279,7 +339,14 @@ class HybridEncoder(nn.Module):
                 ConvNormLayer(hidden_dim, hidden_dim, 3, 2, act=act)
             )
             self.pan_blocks.append(
-                CSPRepLayer(hidden_dim * 2, hidden_dim, round(3 * depth_mult), act=act, expansion=expansion)
+                fpn_pan_block(
+                    hidden_dim * 2,
+                    hidden_dim,
+                    round(3 * depth_mult),
+                    act=act,
+                    expansion=expansion,
+                    **fpn_pan_block_kwargs,
+                )
             )
 
         self._reset_parameters()
