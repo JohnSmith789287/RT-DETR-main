@@ -1,5 +1,9 @@
 __include__: [
-  './rtdetrv2_r18vd_120e_coco.yml',
+  '../dataset/dfire_detection.yml',
+  '../runtime.yml',
+  './include/dataloader.yml',
+  './include/optimizer.yml',
+  './include/rtdetrv2_r50vd.yml',
 ]
 
 
@@ -41,6 +45,36 @@ FireSmokeGuideNet:
 
 HybridEncoder:
   in_channels: [80, 160, 320]
+
+
+RTDETRTransformerv2:
+  num_layers: 3
+
+
+epoches: 72
+
+
+optimizer:
+  type: AdamW
+  params:
+    -
+      params: '^(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+
+
+train_dataloader:
+  total_batch_size: 16
+  dataset:
+    transforms:
+      policy:
+        epoch: 65
+  collate_fn:
+    scales: ~
+    stop_epoch: 65
+
+
+val_dataloader:
+  total_batch_size: 32
 
 
 lr_scheduler:
