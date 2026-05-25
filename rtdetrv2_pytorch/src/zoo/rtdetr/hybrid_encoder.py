@@ -152,6 +152,101 @@ class WaveletCSPRepLayer(nn.Module):
         return self.conv3(x_1 + x_2)
 
 
+class WTConvBlock(nn.Module):
+    """WTConv block used as a RepVggBlock replacement in neck fusion."""
+
+    def __init__(self,
+                 channels,
+                 act="silu",
+                 wt_type='db1',
+                 kernel_size=5,
+                 wt_levels=1):
+        super(WTConvBlock, self).__init__()
+        from ...nn.extra import WTConv2d
+
+        self.wtconv = WTConv2d(
+            channels,
+            channels,
+            kernel_size=kernel_size,
+            wt_levels=wt_levels,
+            wt_type=wt_type,
+            bias=False,
+        )
+        self.norm = nn.BatchNorm2d(channels)
+        self.act = nn.Identity() if act is None else get_activation(act)
+        self.proj = ConvNormLayer(channels, channels, 1, 1, act=act)
+
+    def forward(self, x):
+        x = self.act(self.norm(self.wtconv(x)))
+        return self.proj(x)
+
+
+class WTConvCSPRepLayer(nn.Module):
+    """CSPRepLayer variant that replaces RepVgg blocks with WTConv blocks."""
+
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 num_blocks=3,
+                 expansion=1.0,
+                 bias=None,
+                 act="silu",
+                 wt_type='db1',
+                 kernel_size=5,
+                 wt_levels=1):
+        super(WTConvCSPRepLayer, self).__init__()
+        hidden_channels = int(out_channels * expansion)
+        self.conv1 = ConvNormLayer(in_channels, hidden_channels, 1, 1, bias=bias, act=act)
+        self.conv2 = ConvNormLayer(in_channels, hidden_channels, 1, 1, bias=bias, act=act)
+        self.bottlenecks = nn.Sequential(*[
+            WTConvBlock(
+                hidden_channels,
+                act=act,
+                wt_type=wt_type,
+                kernel_size=kernel_size,
+                wt_levels=wt_levels,
+            )
+            for _ in range(num_blocks)
+        ])
+        if hidden_channels != out_channels:
+            self.conv3 = ConvNormLayer(hidden_channels, out_channels, 1, 1, bias=bias, act=act)
+        else:
+            self.conv3 = nn.Identity()
+
+    def forward(self, x):
+        x_1 = self.conv1(x)
+        x_1 = self.bottlenecks(x_1)
+        x_2 = self.conv2(x)
+        return self.conv3(x_1 + x_2)
+
+
+class HFPFusionLayer(nn.Module):
+    """PHDL LW-Fusion-position replacement using high-frequency perception."""
+
+    def __init__(self,
+                 channels,
+                 act="silu",
+                 wt_type='db1',
+                 kernel_size=3,
+                 init_alpha=0.01):
+        super(HFPFusionLayer, self).__init__()
+        from ...nn.extra.wt_hfp_module import WaveletHighFrequencyPerception
+
+        self.fuse = ConvNormLayer(channels * 2, channels, 1, 1, act=act)
+        self.hfp = WaveletHighFrequencyPerception(
+            channels,
+            wt_type=wt_type,
+            kernel_size=kernel_size,
+        )
+        self.out = ConvNormLayer(channels, channels, 1, 1, act=act)
+        self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
+
+    def forward(self, c_feat, neck_feat):
+        fused = self.fuse(torch.concat([c_feat, neck_feat], dim=1))
+        high = self.out(self.hfp(fused))
+        return neck_feat + self.alpha * high
+
+
 # transformer
 class TransformerEncoderLayer(nn.Module):
     def __init__(self,
@@ -246,7 +341,15 @@ class HybridEncoder(nn.Module):
                  use_wt_hfp_csp=False,
                  wt_hfp_csp_wt_type='db1',
                  wt_hfp_csp_kernel_size=3,
-                 wt_hfp_csp_init_alpha=0.01):
+                 wt_hfp_csp_init_alpha=0.01,
+                 use_wtconv_csp=False,
+                 wtconv_csp_wt_type='db1',
+                 wtconv_csp_kernel_size=5,
+                 wtconv_csp_levels=1,
+                 use_hfp_fusion=False,
+                 hfp_fusion_wt_type='db1',
+                 hfp_fusion_kernel_size=3,
+                 hfp_fusion_init_alpha=0.01):
         super().__init__()
         self.in_channels = in_channels
         self.feat_strides = feat_strides
@@ -306,13 +409,24 @@ class HybridEncoder(nn.Module):
                 for _ in in_channels
             ])
 
-        fpn_pan_block = WaveletCSPRepLayer if use_wt_hfp_csp else CSPRepLayer
+        if use_wt_hfp_csp and use_wtconv_csp:
+            raise ValueError('use_wt_hfp_csp and use_wtconv_csp are mutually exclusive')
+
+        fpn_pan_block = CSPRepLayer
         fpn_pan_block_kwargs = {}
         if use_wt_hfp_csp:
+            fpn_pan_block = WaveletCSPRepLayer
             fpn_pan_block_kwargs = {
                 'wt_type': wt_hfp_csp_wt_type,
                 'kernel_size': wt_hfp_csp_kernel_size,
                 'init_alpha': wt_hfp_csp_init_alpha,
+            }
+        elif use_wtconv_csp:
+            fpn_pan_block = WTConvCSPRepLayer
+            fpn_pan_block_kwargs = {
+                'wt_type': wtconv_csp_wt_type,
+                'kernel_size': wtconv_csp_kernel_size,
+                'wt_levels': wtconv_csp_levels,
             }
 
         # top-down fpn
@@ -348,6 +462,18 @@ class HybridEncoder(nn.Module):
                     **fpn_pan_block_kwargs,
                 )
             )
+
+        if use_hfp_fusion:
+            self.hfp_fusion_layers = nn.ModuleList([
+                HFPFusionLayer(
+                    hidden_dim,
+                    act=act,
+                    wt_type=hfp_fusion_wt_type,
+                    kernel_size=hfp_fusion_kernel_size,
+                    init_alpha=hfp_fusion_init_alpha,
+                )
+                for _ in in_channels
+            ])
 
         self._reset_parameters()
 
@@ -420,5 +546,11 @@ class HybridEncoder(nn.Module):
             downsample_feat = self.downsample_convs[idx](feat_low)
             out = self.pan_blocks[idx](torch.concat([downsample_feat, feat_height], dim=1))
             outs.append(out)
+
+        if hasattr(self, 'hfp_fusion_layers'):
+            outs = [
+                self.hfp_fusion_layers[i](proj_feats[i], outs[i])
+                for i in range(len(outs))
+            ]
 
         return outs
